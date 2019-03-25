@@ -1,0 +1,21 @@
+---
+  - name: rds facts
+    block:
+    - name: gather rds facts
+      rds:
+        command: facts
+        instance_name: "{{ monkey_dbinstance_name }}"
+        profile: "{{ aws_profile }}"
+        region: "{{ aws_region }}"
+      register: aws_rds_securitymonkey
+      delegate_to: "{{ facts_host | default('localhost') }}"
+
+    - name: set security monkey rds uri
+      set_fact:
+        aws_rds_securitymonkey_uri: "{{ aws_rds_securitymonkey.instance.endpoint }}"
+
+    - name: set security monkey rds name
+      set_fact:
+        aws_rds_securitymonkey_dbname: "{{ aws_rds_securitymonkey.instance.name }}"
+
+    when: discover_rds

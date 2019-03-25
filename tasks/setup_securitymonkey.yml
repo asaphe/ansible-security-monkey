@@ -1,0 +1,284 @@
+---
+  - name: git
+    block:
+      - name: remove security monkey's directory
+        file:
+          path: "{{ monkey_path }}"
+          state: absent
+
+      - name: git clone security monkey repository
+        git:
+          repo: "{{ monkey_repository }}"
+          dest: "{{ monkey_path }}"
+          version: "{{ monkey_git_branch }}"
+          depth: 1
+          clone: yes
+
+    become: true
+    tags: [securitymonkey.setup.git]
+
+  - name: pip requirements
+    block:
+      - name: Install python requirements
+        pip:
+          requirements: "{{ monkey_path }}/requirements.txt"
+
+    become: true
+    tags: [securitymonkey.setup.virtualenv]
+
+  - name: prepare directories
+    block:
+      - name: create log directory
+        file:
+          path: "{{ monkey_log_path }}"
+          state: directory
+          owner: "{{ nginx_user }}"
+          group: "{{ nginx_group }}"
+          mode: 0755
+
+      - name: create www directory
+        file:
+          path: "{{ nginx_www_path }}"
+          state: directory
+          owner: "{{ nginx_user }}"
+          group: "{{ nginx_group }}"
+
+    become: true
+    tags: [securitymonkey.setup.directories]
+
+  - name: Virtualenv setup
+    block:
+      - name: Install python packages in Virtualenv
+        pip:
+          virtualenv: "{{ monkey_path }}/venv"
+          virtualenv_python: 'python2.7'
+          requirements: "{{ monkey_path }}/requirements.txt"
+
+    tags: [securitymonkey.setup.virtualenv]
+
+  - name: security monkey setup
+    block:
+      - name: setup.py
+        shell: "source venv/bin/activate && python setup.py {{ monkey_git_branch }}"
+        args:
+          executable: "{{ shell }}"
+          chdir: "{{ monkey_path }}"
+
+      - name: generate password salt for templating
+        set_fact:
+          securitymonkey_password_salt: "{{ ansible_date_time.iso8601_basic | password_hash('sha512') }}"
+        tags: [securitymonkey.template.config]
+
+      - name: generate secret key for templating
+        set_fact:
+          securitymonkey_secret_key: "{{ ansible_date_time.iso8601_basic | password_hash('sha512') }}"
+        tags: [securitymonkey.template.config]
+
+      - name: template env-config/config.py
+        template:
+          src: config.py.j2
+          dest: "{{ monkey_path }}/env-config/config.py"
+          group: "{{ nginx_group }}"
+          mode: 0644
+        tags: [securitymonkey.template.config]
+
+    tags: [securitymonkey.setup.py]
+
+  - name: security monkey additional configuration
+    block:
+      - name: update db tables
+        shell: "source venv/bin/activate && monkey db upgrade"
+        args:
+          executable: "{{ shell }}"
+          chdir: "{{ monkey_path }}"
+
+      - name: add friendly amazon accounts (trust)
+        shell: "source venv/bin/activate && monkey amazon_accounts"
+        args:
+          executable: "{{ shell }}"
+          chdir: "{{ monkey_path }}"
+
+      - name: get s3 canonical ids
+        shell: "source venv/bin/activate && monkey fetch_aws_canonical_ids"
+        args:
+          executable: "{{ shell }}"
+          chdir: "{{ monkey_path }}"
+
+      - name: load initial data
+        shell: "source venv/bin/activate && monkey find_changes -a {{ monkey_aws_account }}"
+        args:
+          executable: "{{ shell }}"
+          chdir: "{{ monkey_path }}"
+        when: load_initial_data
+
+    tags: [securitymonkey.setup.configuration]
+
+  - block:
+      - name: add AWS accounts to security monkey
+        shell: "source {{ monkey_path }}/venv/bin/activate && python manage.py add_account_aws --active --id {{ item.id }} -n '{{ item.name }}' --canonical_id '{{ item.canonicalid }}' --update-existing"
+        args:
+          executable: "{{ shell }}"
+          chdir: "{{ monkey_path }}/security_monkey"
+        ignore_errors: yes                                    #?: the script does not validate arguments. no error if ID is a string. Error if account exists. no point in failing the task.
+        with_items:
+          - "{{ aws_accounts }}"
+
+      - name: restart security monkey scheduler               #?: Due to an open issue. You must restart the scheduler on the scheduler instance after adding a new account
+        shell: supervisorctl restart securitymonkeyscheduler
+        args:
+          executable: "{{ shell }}"
+        become: true
+
+    tags: [securitymonkey.setup.aws.accounts]
+    when: add_accounts_aws
+
+  - name: security monkey users
+    block:
+      - name: create users
+        expect:
+          command: "sudo {{ shell }} -c 'source {{ monkey_path }}/venv/bin/activate' && monkey create_user '{{ item.email }}' '{{ item.role }}'"
+          chdir: "{{ monkey_path }}"
+          echo: no
+          responses:
+            (?i)password: "{{ item.password  }}"
+            (?i)confirm password: "{{ item.password  }}"
+        no_log: true
+        with_items:
+          - "{{ securitymonkey_users }}"
+        when: create_users
+
+    tags: [securitymonkey.setup.monkeyusers]
+
+  - name: supervisord
+    block:
+      - name: supervisord configuration
+        copy:
+          src: "{{ monkey_path }}/supervisor/{{ item }}"
+          dest: /etc/supervisor/conf.d
+          group: "{{ nginx_group }}"
+          mode: 0644
+          remote_src: yes
+        with_items:
+          - "{{ supervisor_files }}"
+
+      - name: supervisord status
+        shell: supervisorctl status
+        args:
+          executable: "{{ shell }}"
+
+    become: true
+    tags: [securitymonkey.setup.supervisord]
+
+  - name: security monkey web-ui
+    block:
+      - name: create web-ui directory
+        file:
+          state: directory
+          path: "{{ monkey_webui_path }}"
+        become: true
+
+      - name:  build security monkey's web-ui
+        shell: /usr/lib/dart/bin/pub get && /usr/lib/dart/bin/pub build
+        args:
+          executable: "{{ shell }}"
+          chdir: "{{ monkey_path }}/dart"
+        when: not download_webui
+
+      - name: copy web-ui's directory
+        shell: "/bin/cp -R {{ monkey_path }}/dart/build/web/* {{ monkey_webui_path }}/"
+        args:
+          executable: "{{ shell }}"
+        become: true
+        when: not download_webui
+
+      - name: untar security monkey's web-ui
+        unarchive:
+          src: "{{ monkey_webui_tar }}"
+          dest: "{{ monkey_path }}"
+          remote_src: yes
+        when: download_webui
+
+      - name: chown web-ui directory
+        file:
+          path: "{{ monkey_webui_path }}"
+          owner: "{{ nginx_user }}"
+          group: "{{ nginx_group }}"
+          recurse: yes
+        become: true
+
+    tags: [securitymonkey.setup.webui]
+
+  - name: nginx setup
+    block:
+      - name: generate an OpenSSL private key
+        openssl_privatekey:
+          path: /etc/ssl/private/server.key
+        register: openssl_privateKey
+
+      - name: generate an OpenSSL certificate request
+        openssl_csr:
+          path: /etc/ssl/certs/server.csr
+          privatekey_path: "{{ openssl_privateKey.filename }}"
+          common_name: "{{ ansible_fqdn }}"
+        register: openssl_request
+
+      - name: generate a Self Signed OpenSSL certificate
+        openssl_certificate:
+          path: /etc/ssl/certs/server.crt
+          privatekey_path: "{{ openssl_privateKey.filename }}"
+          csr_path: "{{ openssl_request.filename }}"
+          provider: selfsigned
+          state: present
+        register: openssl_certificate
+
+      - name: chown /etc/nginx
+        file:
+          path: /etc/nginx
+          owner: "{{ nginx_user }}"
+          group: "{{ nginx_group }}"
+          recurse: yes
+
+      - name: "copy nginx config file (src={{ monkey_path }}/nginx/security_monkey.conf)"
+        copy:
+          src: "{{ monkey_path }}/nginx/security_monkey.conf"
+          dest: /etc/nginx/sites-available/security_monkey.conf
+          owner: "{{ nginx_user }}"
+          group: "{{ nginx_group }}"
+          mode: 0644
+          remote_src: yes
+
+      - name: replace api port in nginx config (datadog-agent conflict)
+        replace:
+          dest: /etc/nginx/sites-available/security_monkey.conf
+          regexp: 'proxy_pass  http://127.0.0.1:5000;'
+          replace: 'proxy_pass  http://127.0.0.1:5600;'
+
+      - name: symlink nginx sites-available security_monkey.conf to sites-enabled
+        file:
+          src: /etc/nginx/sites-available/security_monkey.conf
+          dest: /etc/nginx/sites-enabled/security_monkey.conf
+          state: link
+          owner: "{{ nginx_user }}"
+          group: "{{ nginx_group }}"
+
+      - name: remove Nginx default site
+        file:
+          path: /etc/nginx/sites-enabled/default
+          state: absent
+        with_items:
+          -  /etc/nginx/sites-enabled/default
+          -  /etc/nginx/sites-available/default
+          - /var/www/html/index.nginx-debian.html
+
+      - name: "restart {{ item }}"
+        service:
+          name: "{{ item }}"
+          enabled: yes
+          state: restarted
+        with_items:
+          - nginx.service
+          - supervisor.service
+        tags: [securitymonkey.nginx.restart]
+
+    become: true
+    tags: [securitymonkey.setup.nginx]
