@@ -1,0 +1,44 @@
+---
+  - name: ansible prerequisites
+    block:
+      - name: apt install prerequisites
+        apt:
+          name: python-pip
+          state: latest
+          update_cache: yes
+
+      - name: pip install prerequisites
+        pip:
+          name: "{{ item }}"
+          state: present
+        with_items:
+          - "{{ pip_packages }}"
+
+    become: true
+    tags: [securitymonkey.prerequisites.ansible]
+
+  - name: security monkey prerequisites
+    block:
+      - name: add Google Linux package signing key
+        apt_key:
+          url: https://dl-ssl.google.com/linux/linux_signing_key.pub
+          state: present
+
+      - name: add Google Dart apt repository
+        apt_repository:
+          repo: "deb [arch=amd64] https://storage.googleapis.com/download.dartlang.org/linux/debian stable main"
+          state: present
+
+      - name: Install prerequisites
+        apt:
+          autoclean: yes
+          autoremove: yes
+          update_cache: yes
+          install_recommends: no
+          state: present
+          name: "{{ item }}"
+        with_items:
+          - "{{ apt_packages }}"
+
+    become: true
+    tags: [securitymonkey.prerequisites.monkey]

@@ -1,0 +1,9 @@
+---
+  - import_tasks: prerequisites.yml
+    tags: [securitymonkey.prerequisites]
+
+  - import_tasks: facts.yml
+    tags: [securitymonkey.facts]
+
+  - import_tasks: setup_securitymonkey.yml
+    tags: [securitymonkey.setup]
